@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>名单历史与筛查复核</title>
+<style>
+  body{font:14px/1.6 system-ui,sans-serif;max-width:1200px;margin:24px auto;padding:0 20px;color:#24313c}
+  h1{font-size:22px}h2{margin-top:34px;border-bottom:2px solid #7256b7;padding-bottom:6px}
+  table{border-collapse:collapse;width:100%;margin:12px 0}
+  th,td{border:1px solid #d3dce3;padding:6px 8px;vertical-align:top}
+  th{background:#eef4f7;text-align:left}
+  code{background:#edf0f2;padding:2px 5px;border-radius:3px}
+  .bar{background:#f7f2ff;border-left:5px solid #7256b7;padding:10px 14px;margin:12px 0}
+  .muted{color:#6b7b88;font-size:12px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff;background:#7256b7}
+  .tag.off{background:#8a97a1}.tag.created{background:#4b8b5f}.tag.corrected{background:#b77f2e}.tag.deactivated{background:#b14a4a}
+  .tag.pending{background:#b77f2e}.tag.done{background:#4b8b5f}
+  .tag.conclusion-confirmed{background:#b14a4a}.tag.conclusion-false_positive{background:#4b8b5f}.tag.conclusion-escalate{background:#7256b7}
+  details{margin:4px 0}summary{cursor:pointer;font-weight:600}
+  input,select,button,textarea{font:inherit;padding:4px 8px;margin:2px 0}
+  button{background:#7256b7;color:#fff;border:0;border-radius:4px;padding:6px 14px;cursor:pointer}
+  button.secondary{background:#5c6b78}
+  .err{color:#b14a4a;font-weight:600}
+  .ver-old td{background:#fbf7f0}
+</style>
+</head>
+<body>
+<h1>名单历史与筛查复核</h1>
+<div class="bar">
+  身份（写入接口必需，经 <code>X-User</code> / <code>X-Role</code> 请求头传递）：
+  用户 <input id="user" value="sup1" size="10">
+  角色 <select id="role">
+    <option>supervisor</option><option>investigator</option>
+    <option>director</option><option>auditor</option><option>analyst</option>
+  </select>
+  <button class="secondary" onclick="loadAll()">刷新</button>
+  <a href="/index.html" style="float:right">← 返回调查台</a>
+</div>
+<p class="muted">更正与停用都会保留旧版快照和生效时间；交易筛查命中的条目版本随交易存档；名单变化后受影响交易自动进入待复核，同一版本只生成一次。</p>
+<p id="error" class="err"></p>
+
+<h2>① 名单历史回看</h2>
+<div id="history"></div>
+
+<h2>② 名单变更待复核</h2>
+<p>
+  状态过滤 <select id="rv-status" onchange="loadReviews()">
+    <option value="pending">待复核</option><option value="done">已复核</option><option value="">全部</option>
+  </select>
+</p>
+<div id="reviews"></div>
+
+<h2>③ 案件：交易采用过的名单版本</h2>
+<p>案件 ID <input id="case-id" size="6" placeholder="如 1"> <button onclick="loadCase()">展开案件</button></p>
+<div id="case-detail"></div>
+
+<script>
+const CHANGE_LABEL = {created:"新建", corrected:"更正", deactivated:"停用"};
+const CONCLUSION_LABEL = {confirmed:"维持命中", false_positive:"排除误报", escalate:"升级调查"};
+
+function headers(extra){
+  return Object.assign({"X-User":document.getElementById("user").value.trim(),
+    "X-Role":document.getElementById("role").value}, extra||{});
+}
+function esc(v){return String(v==null?"":v).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+async function api(path, opts){
+  const res = await fetch(path, Object.assign({headers:headers({"Content-Type":"application/json"})}, opts||{}));
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error||("HTTP "+res.status));
+  return data;
+}
+function showError(e){document.getElementById("error").textContent = e.message||String(e);}
+
+async function loadHistory(){
+  const data = await api("/api/watchlist/history");
+  document.getElementById("history").innerHTML = data.entries.length ? "<table><thead><tr>"
+    +"<th>名单</th><th>当前名称</th><th>当前版本</th><th>国家</th><th>状态</th><th>版本历史</th>"
+    +"</tr></thead><tbody>"
+    + data.entries.map(e=>`<tr>
+        <td>${esc(e.list_name)}</td><td>${esc(e.name)}</td><td>v${e.version}</td>
+        <td>${esc(e.countries)}</td>
+        <td>${e.active?'<span class="tag">生效中</span>':'<span class="tag off">已停用</span>'}</td>
+        <td><details><summary>${e.versions.length} 个版本（点击展开）</summary>
+          <table><thead><tr><th>版本</th><th>变更</th><th>名称</th><th>国家</th><th>生效时间</th><th>操作人</th></tr></thead>
+          <tbody>${e.versions.map(v=>`<tr class="${v.version===e.version?'':'ver-old'}">
+            <td>v${v.version}</td>
+            <td><span class="tag ${v.change_type}">${CHANGE_LABEL[v.change_type]||v.change_type}</span></td>
+            <td>${esc(v.name)} ${v.active?'':'<span class="muted">(该版已停用)</span>'}</td>
+            <td>${esc(v.countries)}</td><td>${esc(v.effective_at)}</td><td>${esc(v.changed_by)}</td></tr>`).join("")}
+          </tbody></table></details></td></tr>`).join("")
+    + "</tbody></table>" : "<p class='muted'>暂无名单</p>";
+}
+
+async function loadReviews(){
+  const st = document.getElementById("rv-status").value;
+  const data = await api("/api/watchlist/reviews"+(st?("?status="+st):""));
+  const rows = data.reviews;
+  document.getElementById("reviews").innerHTML = rows.length ? "<table><thead><tr>"
+    +"<th>#</th><th>交易</th><th>名单条目</th><th>命中版本→新版本</th><th>交易原状态</th>"
+    +"<th>复核状态</th><th>结论/处理人</th><th>操作</th></tr></thead><tbody>"
+    + rows.map(r=>`<tr>
+      <td>${r.id}</td><td>${esc(r.txn_ref)}<div class="muted">${esc(r.txn_reason)}</div></td>
+      <td>#${r.watchlist_entry_id}</td><td>v${r.from_version} → v${r.to_version}</td>
+      <td>${esc(r.txn_status)}</td>
+      <td><span class="tag ${r.status}">${r.status==='pending'?'待复核':'已复核'}</span></td>
+      <td>${r.conclusion?`<span class="tag conclusion-${r.conclusion}">${CONCLUSION_LABEL[r.conclusion]||r.conclusion}</span> ${esc(r.reviewed_by)}<div class="muted">${esc(r.reviewed_at)} ${esc(r.reason)}</div>`:'—'}</td>
+      <td>${r.status==='pending'?resolveControls(r.id):""}</td></tr>`).join("")
+    + "</tbody></table>" : "<p class='muted'>没有符合条件的复核任务</p>";
+}
+function resolveControls(id){
+  return `<select id="c-${id}">
+      <option value="confirmed">维持命中</option>
+      <option value="false_positive">排除误报</option>
+      <option value="escalate">升级调查</option></select>
+    <input id="n-${id}" size="14" placeholder="说明（可选）">
+    <button onclick="resolve(${id})">提交</button>`;
+}
+async function resolve(id){
+  try{
+    await api("/api/watchlist/reviews/resolve",{method:"POST",body:JSON.stringify({
+      review_id:id, conclusion:document.getElementById("c-"+id).value,
+      note:document.getElementById("n-"+id).value})});
+    await loadReviews();
+  }catch(e){showError(e);}
+}
+
+async function loadCase(){
+  const id = document.getElementById("case-id").value.trim();
+  if(!id) return;
+  const data = await api("/api/cases/"+encodeURIComponent(id));
+  const c = data.case;
+  const hits = data.screening_hits||[];
+  document.getElementById("case-detail").innerHTML =
+    `<p>案件 <b>${esc(c.case_no)}</b>（状态 ${esc(c.status)}，调查员 ${esc(c.assignee||"")}），共 ${hits.length} 条名单命中存档</p>`
+    + (hits.length ? "<table><thead><tr><th>交易</th><th>命中名单</th><th>命中名称</th><th>命中时采用版本</th><th>版本生效时间</th><th>筛查时间</th><th>版本演变与复核</th></tr></thead><tbody>"
+      + hits.map(h=>`<tr>
+          <td>${h.transaction?esc(h.transaction.txn_ref):("#"+h.transaction_id)}<div class="muted">${h.transaction?esc(h.transaction.status):""}</div></td>
+          <td>${esc(h.list_name)}</td><td>${esc(h.matched_name)}</td>
+          <td><span class="tag">v${h.entry_version}</span><div class="muted">相似度 ${h.match_score}</div></td>
+          <td>${esc(h.entry_effective_at)}</td><td>${esc(h.screened_at)}</td>
+          <td><details><summary>条目版本（${h.entry_versions.length}）+ 复核（${h.reviews.length}）</summary>
+            <table><thead><tr><th>版本</th><th>变更</th><th>名称</th><th>生效时间</th></tr></thead><tbody>
+            ${h.entry_versions.map(v=>`<tr class="${v.version===h.entry_version?'':'ver-old'}">
+              <td>v${v.version} ${v.version===h.entry_version?'<b>← 命中版</b>':""}</td>
+              <td><span class="tag ${v.change_type}">${CHANGE_LABEL[v.change_type]||v.change_type}</span></td>
+              <td>${esc(v.name)} ${v.active?'':'<span class="muted">(停用)</span>'}</td><td>${esc(v.effective_at)}</td></tr>`).join("")}
+            </tbody></table>
+            <table><thead><tr><th>触发新版</th><th>状态</th><th>结论</th><th>处理人</th><th>时间</th><th>说明</th></tr></thead><tbody>
+            ${h.reviews.length ? h.reviews.map(r=>`<tr><td>v${r.to_version}</td>
+              <td>${r.status==='pending'?'<span class="tag pending">待复核</span>':'<span class="tag done">已复核</span>'}</td>
+              <td>${r.conclusion?CONCLUSION_LABEL[r.conclusion]:"—"}</td><td>${esc(r.reviewed_by||"")}</td>
+              <td>${esc(r.reviewed_at||"")}</td><td>${esc(r.reason)}</td></tr>`).join("")
+              : '<tr><td colspan="6" class="muted">名单此后未变更</td></tr>'}
+            </tbody></table></details></td></tr>`).join("")
+      + "</tbody></table>" : "<p class='muted'>该案件相关交易没有名单命中存档。</p>");
+}
+
+async function loadAll(){
+  try{document.getElementById("error").textContent="";await Promise.all([loadHistory(),loadReviews()]);}
+  catch(e){showError(e);}
+}
+loadAll();
+</script>
+</body>
+</html>

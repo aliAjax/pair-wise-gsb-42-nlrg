@@ -4,59 +4,33 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sqlite3
-from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from core import (
+    DomainError,
+    HIGH_RISK_COUNTRIES,
+    SENSITIVE_ROLES,
+    clean_actor,
+    normalize_name,
+    require_role,
+    utcnow,
+)
+from screening_archive import ScreeningStore
+from watchlist_history import WatchlistStore
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "financial_crime.db"
-HIGH_RISK_COUNTRIES = {"KP", "IR", "SY", "CU", "RU"}
-SENSITIVE_ROLES = {"investigator", "supervisor", "director", "auditor"}
-
-
-class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.status = status
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def normalize_name(value: str) -> str:
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (value or "").casefold())
-
-
-def require_role(role: str, allowed: set[str], action: str) -> None:
-    if role not in allowed:
-        raise DomainError("角色无权执行：%s" % action, 403)
-
-
-def clean_actor(actor: str) -> str:
-    actor = (actor or "").strip()
-    if not actor:
-        raise DomainError("缺少操作人")
-    return actor
-
-
-def name_similarity(left: str, right: str) -> float:
-    left, right = normalize_name(left), normalize_name(right)
-    if not left or not right:
-        return 0.0
-    if left == right:
-        return 1.0
-    return SequenceMatcher(None, left, right).ratio()
 
 
 class FinancialCrimeService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
+        self.watchlist_store = WatchlistStore()
+        self.screening_store = ScreeningStore(self.watchlist_store)
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -95,18 +69,6 @@ class FinancialCrimeService:
                     merged_into INTEGER REFERENCES customers(id),
                     version INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS watchlist (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    list_name TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    normalized_name TEXT NOT NULL,
-                    countries TEXT NOT NULL DEFAULT '[]',
-                    version INTEGER NOT NULL DEFAULT 1,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    updated_by TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(list_name, normalized_name)
                 );
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,6 +142,9 @@ class FinancialCrimeService:
                 CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status, risk_score DESC);
                 """
             )
+            # 名单历史、筛查存档分别由独立模块建表
+            self.watchlist_store.init_schema(conn)
+            self.screening_store.init_schema(conn)
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, details: dict[str, Any],
                entity_id: int | None = None, case_id: int | None = None) -> None:
@@ -292,47 +257,44 @@ class FinancialCrimeService:
 
     def add_or_update_watchlist(self, actor: str, role: str, list_name: str, name: str,
                                 countries: list[str] | None = None,
-                                active: bool = True, expected_version: int | None = None) -> dict[str, Any]:
+                                active: bool = True, expected_version: int | None = None,
+                                entry_id: int | None = None) -> dict[str, Any]:
+        """新增名单条目，或对已有条目做版本化更正/停用；旧版快照保留在名单历史中。
+
+        条目产生新版本后，命中过旧版本的交易自动进入待复核（同一版本只生成一次）。
+        """
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "维护制裁名单")
-        list_name, name = list_name.strip(), name.strip()
-        normalized = normalize_name(name)
-        countries_json = json.dumps(sorted({c.strip().upper() for c in (countries or []) if c.strip()}), ensure_ascii=False)
-        if not list_name or not normalized:
-            raise DomainError("名单名称和实体名称不能为空")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM watchlist WHERE list_name=? AND normalized_name=?", (list_name, normalized)).fetchone()
-            if row:
-                if expected_version is not None and row["version"] != int(expected_version):
-                    raise DomainError("名单条目已变化，请刷新后重试", 409)
-                conn.execute(
-                    "UPDATE watchlist SET name=?,countries=?,active=?,version=version+1,updated_by=?,updated_at=? WHERE id=?",
-                    (name, countries_json, int(bool(active)), actor, utcnow(), row["id"]),
-                )
-                self._audit(conn, actor, "watchlist.updated", {"list_name": list_name, "name": name, "active": active})
-                return dict(conn.execute("SELECT * FROM watchlist WHERE id=?", (row["id"],)).fetchone())
-            cur = conn.execute(
-                "INSERT INTO watchlist(list_name,name,normalized_name,countries,active,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (list_name, name, normalized, countries_json, int(bool(active)), actor, utcnow()),
+            previous = None
+            if entry_id is not None:
+                previous = conn.execute("SELECT * FROM watchlist WHERE id=?", (int(entry_id),)).fetchone()
+                if previous is None:
+                    raise DomainError("名单条目不存在", 404)
+            elif expected_version is not None:
+                # 未提供 entry_id 时沿用按名称定位的旧调用方式
+                previous = conn.execute(
+                    "SELECT * FROM watchlist WHERE list_name=? AND normalized_name=?",
+                    (list_name.strip(), normalize_name(name)),
+                ).fetchone()
+            result = self.watchlist_store.upsert(
+                conn, actor, list_name, name, countries, active, expected_version, entry_id
             )
-            self._audit(conn, actor, "watchlist.added", {"list_name": list_name, "name": name})
-            return dict(conn.execute("SELECT * FROM watchlist WHERE id=?", (cur.lastrowid,)).fetchone())
-
-    def _screen(self, counterparty_name: str, country: str) -> tuple[float, str | None]:
-        with self.connect() as conn:
-            entries = conn.execute("SELECT * FROM watchlist WHERE active=1").fetchall()
-        best_score, best = 0.0, None
-        for row in entries:
-            countries = json.loads(row["countries"])
-            if countries and country.upper() not in countries:
-                continue
-            score = name_similarity(counterparty_name, row["name"])
-            if score > best_score:
-                best_score, best = score, row
-        if best and best_score >= 0.9:
-            return 0.95, "sanctions_match:%s:%s" % (best["list_name"], best["name"])
-        return best_score, None
+            queued = 0
+            if previous is not None and result["version"] != previous["version"]:
+                queued = self.screening_store.enqueue_reviews_for_change(
+                    conn, result["id"], previous["version"], result["version"]
+                )
+            action = "watchlist.added" if result["version"] == 1 else "watchlist.updated"
+            self._audit(
+                conn, actor, action,
+                {"list_name": result["list_name"], "name": result["name"],
+                 "active": bool(result["active"]), "version": result["version"],
+                 "reviews_queued": queued},
+            )
+            result["reviews_queued"] = queued
+            return result
 
     def ingest_transaction(self, actor: str, role: str, txn_ref: str, customer_id: int,
                            amount: float, currency: str, counterparty_name: str,
@@ -352,7 +314,10 @@ class FinancialCrimeService:
                 raise DomainError("客户不存在", 404)
             entity = self._resolve_entity(conn, customer["entity_id"])
             country = counterparty_country.strip().upper()
-            match_score, match_reason = self._screen(counterparty_name.strip(), country)
+            screened_at = utcnow()
+            match_score, match_reason, matched_entry = self.screening_store.screen(
+                conn, counterparty_name.strip(), country
+            )
             base_risk = customer["risk_score"]
             reason = "normal"
             if match_reason:
@@ -387,6 +352,12 @@ class FinancialCrimeService:
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("交易编号已存在", 409) from exc
+            # 命中制裁名单时，把当时采用的名单条目版本一并存档（与后续是否阻断无关）
+            screening_archive = None
+            if matched_entry is not None:
+                screening_archive = self.screening_store.archive_hit(
+                    conn, cur.lastrowid, entity["id"], matched_entry, match_score, screened_at
+                )
             alert = None
             if status in {"review", "escalated", "blocked"}:
                 fingerprint = "%s|%s|%s" % (entity["id"], reason.split(":")[0], normalize_name(counterparty_name))
@@ -409,7 +380,8 @@ class FinancialCrimeService:
                 conn.execute("UPDATE transactions SET status='blocked' WHERE entity_id=? AND status='review'", (entity["id"],))
             self._audit(conn, actor, "transaction.ingested", {"txn_ref": txn_ref, "status": status, "reason": reason}, entity["id"])
             transaction = dict(conn.execute("SELECT * FROM transactions WHERE id=?", (cur.lastrowid,)).fetchone())
-            return {"transaction": transaction, "alert": alert, "resolved_entity_id": entity["id"]}
+            return {"transaction": transaction, "alert": alert,
+                    "screening_archive": screening_archive, "resolved_entity_id": entity["id"]}
 
     def triage_alert(self, actor: str, role: str, alert_id: int, decision: str,
                     assignee: str | None = None, case_no: str | None = None,
@@ -598,7 +570,45 @@ class FinancialCrimeService:
                 raise DomainError("案件不存在", 404)
             self._case_access(actor, role, case)
             notes = [dict(r) for r in conn.execute("SELECT * FROM case_notes WHERE case_id=? ORDER BY id", (case_id,)).fetchall()]
-            return {"case": dict(case), "notes": notes}
+            # 案件详情可展开：相关交易采用过的名单版本及后续复核处理
+            screening_hits = self.screening_store.archives_for_entity(conn, case["entity_id"])
+            txn_rows = conn.execute(
+                "SELECT id,txn_ref,status,reason,risk_score FROM transactions WHERE entity_id=? ORDER BY id",
+                (case["entity_id"],),
+            ).fetchall()
+            txn_index = {r["id"]: dict(r) for r in txn_rows}
+            for hit in screening_hits:
+                hit["transaction"] = txn_index.get(hit["transaction_id"])
+                hit["entry_versions"] = self.watchlist_store.versions_of(conn, hit["watchlist_entry_id"])
+            return {"case": dict(case), "notes": notes, "screening_hits": screening_hits}
+
+    def watchlist_history(self, actor: str, role: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        if role not in SENSITIVE_ROLES:
+            raise DomainError("角色无权查看名单历史", 403)
+        with self.connect() as conn:
+            return {"entries": self.watchlist_store.history_view(conn)}
+
+    def list_reviews(self, actor: str, role: str, status: str | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        if role not in SENSITIVE_ROLES:
+            raise DomainError("角色无权查看名单复核", 403)
+        with self.connect() as conn:
+            return {"reviews": self.screening_store.list_reviews(conn, status)}
+
+    def resolve_review(self, actor: str, role: str, review_id: int, conclusion: str,
+                       note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"investigator", "supervisor"}, "处理名单复核")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            review = self.screening_store.resolve_review(conn, review_id, actor, conclusion, note)
+            self._audit(
+                conn, actor, "watchlist.review_resolved",
+                {"review_id": review_id, "conclusion": conclusion, "note": note.strip(),
+                 "transaction_id": review["transaction_id"], "to_version": review["to_version"]},
+            )
+            return review
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         if role not in SENSITIVE_ROLES:
@@ -662,9 +672,18 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path in {"/", "/index.html"}:
                 body = (ROOT / "static" / "index.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path in {"/watchlist", "/watchlist.html"}:
+                body = (ROOT / "static" / "watchlist.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -676,6 +695,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", "service": "financial-crime"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path == "/api/watchlist/history":
+                self._send(200, self.service.watchlist_history(actor, role))
+            elif path == "/api/watchlist/reviews":
+                status = parse_qs(parsed.query).get("status", [None])[0]
+                self._send(200, self.service.list_reviews(actor, role, status))
             elif path.startswith("/api/cases/"):
                 self._send(200, self.service.get_case(actor, role, int(path.split("/")[3])))
             else:
@@ -710,6 +734,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.merge_entities(actor, role, **data)
             elif path == "/api/cases/report":
                 result = self.service.file_report(actor, role, **data)
+            elif path == "/api/watchlist/reviews/resolve":
+                result = self.service.resolve_review(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
