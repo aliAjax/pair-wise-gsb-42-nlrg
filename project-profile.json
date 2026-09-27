@@ -1,0 +1,11 @@
+{
+  "projectId": "pair-wise-gsb-42",
+  "projectName": "pair-wise-gsb-42",
+  "category": "地狱 Python 项目",
+  "businessDomain": "金融合规",
+  "projectForm": "完整项目",
+  "codeScope": "backend, frontend",
+  "languages": ["Python", "HTML", "CSS", "JavaScript"],
+  "summary": "金融犯罪交易筛查、制裁名单、案件调查、实体合并、冻结和监管报告系统。",
+  "containerized": false
+}
