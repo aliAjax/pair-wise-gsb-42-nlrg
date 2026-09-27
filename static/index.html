@@ -1,7 +1,47 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>金融犯罪调查</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#24313c}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#eef4f7}.card{background:#f7f2ff;border-left:5px solid #7256b7;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>金融犯罪调查与制裁筛查</h1><div class="card">案件严格按角色和调查员分配过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>案件</h2><table id="cases"><thead><tr><th>案件号</th><th>状态</th><th>风险</th><th>调查员</th><th>报告</th></tr></thead><tbody></tbody></table>
-<h2>交易</h2><table id="txns"><thead><tr><th>编号</th><th>金额</th><th>币种</th><th>状态</th><th>原因</th></tr></thead><tbody></tbody></table>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1280px;margin:28px auto;padding:0 20px;color:#24313c}
+table{border-collapse:collapse;width:100%;margin:14px 0}
+th,td{border:1px solid #d3dce3;padding:7px;vertical-align:top}
+th{background:#eef4f7}
+table.sub{margin:6px 0;font-size:13px;background:#fbfcfe}
+.card{background:#f7f2ff;border-left:5px solid #7256b7;padding:12px 16px}
+code{background:#edf0f2;padding:2px 5px}
+.badge{background:#c0392b;color:#fff;border-radius:9px;padding:1px 8px;font-size:12px;margin-left:6px}
+.off{color:#c0392b}
+tr.pending{background:#fdecea}
+.versions{margin-top:6px}
+button{margin:0 3px 0 0;cursor:pointer}
+.block-title{font-weight:700;margin:12px 0 4px;color:#3b3360}
+.txn-block{border:1px solid #d9d2ee;border-radius:6px;padding:8px 10px;margin:8px 0;background:#fcfaff}
+#panel{display:none;position:fixed;right:0;top:0;width:52%;height:100%;background:#fff;border-left:3px solid #7256b7;
+  box-shadow:-4px 0 18px rgba(0,0,0,.15);padding:18px 22px;overflow:auto;z-index:10}
+#panel.show{display:block}
+#panel-close{float:right}
+.bar{display:flex;gap:8px;align-items:center;margin:10px 0}
+h2{margin-top:28px;border-bottom:2px solid #e5e0f0;padding-bottom:4px}
+</style>
+<h1>金融犯罪调查与制裁筛查</h1>
+<div class="card">写入接口需要 <code>X-User</code>、<code>X-Role</code>。名单更正或停用后，受影响交易会自动进入复核队列（同一版本只生成一次）；案件详情可展开交易当时命中的名单版本，服务重启后记录仍可追查。</div>
+<div class="bar">
+  用户 <input id="user" size="12"> 角色
+  <select id="role"><option>analyst</option><option>investigator</option><option selected>supervisor</option><option>director</option><option>auditor</option></select>
+  <button id="save-id">切换身份</button><button id="refresh">刷新</button>
+</div>
+
+<h2>名单变化复核队列</h2>
+<table id="reviews"><thead><tr><th>#</th><th>交易</th><th>名单条目</th><th>版本</th><th>变化</th><th>状态/结论</th><th>处理人</th><th>操作/备注</th></tr></thead><tbody></tbody></table>
+
+<h2>制裁名单与历史版本</h2>
+<table id="watchlist"><thead><tr><th>#</th><th>名单</th><th>名称</th><th>版本</th><th>状态</th><th>更新时间</th><th>历史</th></tr></thead><tbody></tbody></table>
+
+<h2>案件</h2>
+<table id="cases"><thead><tr><th>案件号</th><th>状态</th><th>风险</th><th>调查员</th><th>报告</th></tr></thead><tbody></tbody></table>
+
+<h2>交易（含筛查存档）</h2>
+<table id="txns"><thead><tr><th>编号</th><th>金额</th><th>币种</th><th>状态</th><th>原因</th><th>名单版本</th></tr></thead><tbody></tbody></table>
+
 <h2>审计时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#cases tbody').innerHTML=d.cases.map(r=>`<tr><td>${r.case_no}</td><td>${r.status}</td><td>${r.risk_score}</td><td>${r.assignee||''}</td><td>${r.report_ref||''}</td></tr>`).join('');document.querySelector('#txns tbody').innerHTML=d.transactions.map(r=>`<tr><td>${r.txn_ref}</td><td>${r.amount}</td><td>${r.currency}</td><td>${r.status}</td><td>${r.reason}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+
+<div id="panel"><button id="panel-close">关闭</button><h3 id="panel-title"></h3><div id="panel-body"></div></div>
+<script src="/app.js"></script>

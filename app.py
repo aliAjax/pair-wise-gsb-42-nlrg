@@ -54,6 +54,151 @@ def name_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, left, right).ratio()
 
 
+class WatchlistHistory:
+    """名单历史：条目每次创建、更正、停用、重新启用都留存版本快照和生效时间。"""
+
+    CREATED = "created"
+    CORRECTED = "corrected"
+    DEACTIVATED = "deactivated"
+    REACTIVATED = "reactivated"
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def record(self, entry: sqlite3.Row, change_type: str, actor: str, effective_at: str) -> int:
+        cur = self.conn.execute(
+            """INSERT INTO watchlist_versions
+               (entry_id,list_name,name,normalized_name,countries,version,active,change_type,changed_by,effective_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (entry["id"], entry["list_name"], entry["name"], entry["normalized_name"],
+             entry["countries"], entry["version"], entry["active"], change_type, actor, effective_at),
+        )
+        return cur.lastrowid
+
+    def version_id(self, entry_id: int, version: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT id FROM watchlist_versions WHERE entry_id=? AND version=?",
+            (entry_id, version),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def versions(self, entry_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM watchlist_versions WHERE entry_id=? ORDER BY version",
+            (entry_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+class ScreeningArchive:
+    """筛查存档：筛查命中时把命中条目的当时版本随交易一并快照留档。"""
+
+    INITIAL = "initial"
+    RESCREEN = "rescreen"
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def _insert(self, transaction_id: int, entry: sqlite3.Row | None, score: float, kind: str,
+                actor: str, screened_at: str, review_id: int | None = None) -> dict[str, Any]:
+        version_id = (
+            WatchlistHistory(self.conn).version_id(entry["id"], entry["version"])
+            if entry is not None else None
+        )
+        cur = self.conn.execute(
+            """INSERT INTO screening_archives(transaction_id,watchlist_entry_id,watchlist_version_id,
+               list_name,entry_name,entry_version,entry_active,countries,normalized_name,score,
+               kind,review_id,screened_by,screened_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (transaction_id, entry["id"] if entry else None, version_id,
+             entry["list_name"] if entry else None, entry["name"] if entry else None,
+             entry["version"] if entry else None, entry["active"] if entry else None,
+             entry["countries"] if entry else "[]", entry["normalized_name"] if entry else None,
+             score, kind, review_id, actor, screened_at),
+        )
+        return dict(self.conn.execute("SELECT * FROM screening_archives WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def record_initial(self, transaction_id: int, entry: sqlite3.Row, score: float,
+                       actor: str, screened_at: str) -> dict[str, Any]:
+        return self._insert(transaction_id, entry, score, self.INITIAL, actor, screened_at)
+
+    def record_rescreen(self, transaction_id: int, entry: sqlite3.Row | None, score: float,
+                        review_id: int, actor: str, screened_at: str) -> dict[str, Any]:
+        return self._insert(transaction_id, entry, score, self.RESCREEN, actor, screened_at, review_id)
+
+    def for_transactions(self, transaction_ids: set[int]) -> dict[int, list[dict[str, Any]]]:
+        if not transaction_ids:
+            return {}
+        marks = ",".join("?" for _ in transaction_ids)
+        rows = self.conn.execute(
+            """SELECT sa.*, wv.effective_at AS version_effective_at, wv.change_type AS version_change_type
+               FROM screening_archives sa
+               LEFT JOIN watchlist_versions wv ON wv.id=sa.watchlist_version_id
+               WHERE sa.transaction_id IN (%s) ORDER BY sa.id""" % marks,
+            tuple(transaction_ids),
+        ).fetchall()
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(row["transaction_id"], []).append(dict(row))
+        return grouped
+
+
+class ListReviewQueue:
+    """名单变化复核队列：受影响交易自动待复核，同一版本对同一交易只入队一次。"""
+
+    PENDING = "pending"
+    REVIEWED = "reviewed"
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def enqueue_affected(self, entry_id: int, to_version: int, trigger_change: str, now: str) -> int:
+        cur = self.conn.execute(
+            """INSERT OR IGNORE INTO watchlist_reviews
+               (transaction_id,watchlist_entry_id,from_version,to_version,trigger_change,status,created_at)
+               SELECT sa.transaction_id,?,sa.entry_version,?,?,'pending',?
+               FROM screening_archives sa
+               WHERE sa.watchlist_entry_id=? AND sa.kind='initial'""",
+            (entry_id, to_version, trigger_change, now, entry_id),
+        )
+        return cur.rowcount
+
+    def for_transactions(self, transaction_ids: set[int]) -> dict[int, list[dict[str, Any]]]:
+        if not transaction_ids:
+            return {}
+        marks = ",".join("?" for _ in transaction_ids)
+        rows = self.conn.execute(
+            """SELECT r.*, w.list_name AS list_name, w.name AS entry_name
+               FROM watchlist_reviews r
+               LEFT JOIN watchlist w ON w.id=r.watchlist_entry_id
+               WHERE r.transaction_id IN (%s) ORDER BY r.id""" % marks,
+            tuple(transaction_ids),
+        ).fetchall()
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(row["transaction_id"], []).append(dict(row))
+        return grouped
+
+    def pending_transaction_ids(self) -> set[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT transaction_id FROM watchlist_reviews WHERE status='pending'"
+        ).fetchall()
+        return {row["transaction_id"] for row in rows}
+
+    def list_all(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT r.*, w.list_name AS list_name, w.name AS entry_name,
+                      t.txn_ref AS txn_ref, t.status AS txn_status,
+                      t.counterparty_name AS counterparty_name, t.counterparty_country AS counterparty_country
+               FROM watchlist_reviews r
+               JOIN transactions t ON t.id=r.transaction_id
+               LEFT JOIN watchlist w ON w.id=r.watchlist_entry_id
+               ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, r.id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 class FinancialCrimeService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
@@ -176,6 +321,57 @@ class FinancialCrimeService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS watchlist_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entry_id INTEGER NOT NULL REFERENCES watchlist(id),
+                    list_name TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    countries TEXT NOT NULL DEFAULT '[]',
+                    version INTEGER NOT NULL,
+                    active INTEGER NOT NULL,
+                    change_type TEXT NOT NULL,
+                    changed_by TEXT NOT NULL,
+                    effective_at TEXT NOT NULL,
+                    UNIQUE(entry_id, version)
+                );
+                CREATE TABLE IF NOT EXISTS screening_archives (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transaction_id INTEGER NOT NULL REFERENCES transactions(id),
+                    watchlist_entry_id INTEGER REFERENCES watchlist(id),
+                    watchlist_version_id INTEGER REFERENCES watchlist_versions(id),
+                    list_name TEXT,
+                    entry_name TEXT,
+                    entry_version INTEGER,
+                    entry_active INTEGER,
+                    countries TEXT NOT NULL DEFAULT '[]',
+                    normalized_name TEXT,
+                    score REAL NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'initial',
+                    review_id INTEGER,
+                    screened_by TEXT NOT NULL,
+                    screened_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS watchlist_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transaction_id INTEGER NOT NULL REFERENCES transactions(id),
+                    watchlist_entry_id INTEGER NOT NULL REFERENCES watchlist(id),
+                    from_version INTEGER NOT NULL,
+                    to_version INTEGER NOT NULL,
+                    trigger_change TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    conclusion TEXT,
+                    handled_by TEXT,
+                    handled_at TEXT,
+                    note TEXT,
+                    rescreen_archive_id INTEGER REFERENCES screening_archives(id),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(transaction_id, watchlist_entry_id, to_version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_wv_entry ON watchlist_versions(entry_id, version);
+                CREATE INDEX IF NOT EXISTS idx_sa_txn ON screening_archives(transaction_id);
+                CREATE INDEX IF NOT EXISTS idx_sa_entry ON screening_archives(watchlist_entry_id);
+                CREATE INDEX IF NOT EXISTS idx_wr_status ON watchlist_reviews(status, id);
                 CREATE INDEX IF NOT EXISTS idx_txn_entity ON transactions(entity_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status, risk_score DESC);
                 """
@@ -292,7 +488,8 @@ class FinancialCrimeService:
 
     def add_or_update_watchlist(self, actor: str, role: str, list_name: str, name: str,
                                 countries: list[str] | None = None,
-                                active: bool = True, expected_version: int | None = None) -> dict[str, Any]:
+                                active: bool = True, expected_version: int | None = None,
+                                entry_id: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "维护制裁名单")
         list_name, name = list_name.strip(), name.strip()
@@ -302,26 +499,61 @@ class FinancialCrimeService:
             raise DomainError("名单名称和实体名称不能为空")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM watchlist WHERE list_name=? AND normalized_name=?", (list_name, normalized)).fetchone()
+            history = WatchlistHistory(conn)
+            row = None
+            if entry_id is not None:
+                row = conn.execute("SELECT * FROM watchlist WHERE id=?", (int(entry_id),)).fetchone()
+                if not row:
+                    raise DomainError("名单条目不存在", 404)
+            else:
+                row = conn.execute(
+                    "SELECT * FROM watchlist WHERE list_name=? AND normalized_name=?", (list_name, normalized)
+                ).fetchone()
+            now = utcnow()
             if row:
                 if expected_version is not None and row["version"] != int(expected_version):
                     raise DomainError("名单条目已变化，请刷新后重试", 409)
-                conn.execute(
-                    "UPDATE watchlist SET name=?,countries=?,active=?,version=version+1,updated_by=?,updated_at=? WHERE id=?",
-                    (name, countries_json, int(bool(active)), actor, utcnow(), row["id"]),
+                was_active, new_active = bool(row["active"]), bool(active)
+                corrected = name != row["name"] or countries_json != row["countries"]
+                if not corrected and was_active == new_active:
+                    return {"entry": dict(row), "history_version_id": None, "enqueued_reviews": 0, "changed": False}
+                change_type = (
+                    WatchlistHistory.DEACTIVATED if was_active and not new_active else
+                    WatchlistHistory.REACTIVATED if not was_active and new_active else
+                    WatchlistHistory.CORRECTED
                 )
-                self._audit(conn, actor, "watchlist.updated", {"list_name": list_name, "name": name, "active": active})
-                return dict(conn.execute("SELECT * FROM watchlist WHERE id=?", (row["id"],)).fetchone())
-            cur = conn.execute(
-                "INSERT INTO watchlist(list_name,name,normalized_name,countries,active,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (list_name, name, normalized, countries_json, int(bool(active)), actor, utcnow()),
-            )
-            self._audit(conn, actor, "watchlist.added", {"list_name": list_name, "name": name})
-            return dict(conn.execute("SELECT * FROM watchlist WHERE id=?", (cur.lastrowid,)).fetchone())
+                try:
+                    conn.execute(
+                        "UPDATE watchlist SET list_name=?,name=?,normalized_name=?,countries=?,active=?,version=version+1,updated_by=?,updated_at=? WHERE id=?",
+                        (list_name, name, normalized, countries_json, int(new_active), actor, now, row["id"]),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise DomainError("同一名单下已存在该名称的条目", 409) from exc
+                updated = conn.execute("SELECT * FROM watchlist WHERE id=?", (row["id"],)).fetchone()
+                history_version_id = history.record(updated, change_type, actor, now)
+                enqueued = ListReviewQueue(conn).enqueue_affected(updated["id"], updated["version"], change_type, now)
+                self._audit(conn, actor, "watchlist.updated",
+                            {"list_name": list_name, "name": name, "active": new_active,
+                             "entry_id": updated["id"], "version": updated["version"],
+                             "change_type": change_type, "affected_transactions": enqueued})
+                return {"entry": dict(updated), "history_version_id": history_version_id,
+                        "enqueued_reviews": enqueued, "changed": True}
+            try:
+                cur = conn.execute(
+                    "INSERT INTO watchlist(list_name,name,normalized_name,countries,active,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (list_name, name, normalized, countries_json, int(bool(active)), actor, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("名单条目已存在", 409) from exc
+            entry = conn.execute("SELECT * FROM watchlist WHERE id=?", (cur.lastrowid,)).fetchone()
+            history_version_id = history.record(entry, WatchlistHistory.CREATED, actor, now)
+            self._audit(conn, actor, "watchlist.added", {"list_name": list_name, "name": name, "entry_id": entry["id"]})
+            return {"entry": dict(entry), "history_version_id": history_version_id,
+                    "enqueued_reviews": 0, "changed": True}
 
-    def _screen(self, counterparty_name: str, country: str) -> tuple[float, str | None]:
-        with self.connect() as conn:
-            entries = conn.execute("SELECT * FROM watchlist WHERE active=1").fetchall()
+    def _match_entry(self, conn: sqlite3.Connection, counterparty_name: str,
+                     country: str) -> tuple[float, sqlite3.Row | None]:
+        entries = conn.execute("SELECT * FROM watchlist WHERE active=1").fetchall()
         best_score, best = 0.0, None
         for row in entries:
             countries = json.loads(row["countries"])
@@ -331,7 +563,7 @@ class FinancialCrimeService:
             if score > best_score:
                 best_score, best = score, row
         if best and best_score >= 0.9:
-            return 0.95, "sanctions_match:%s:%s" % (best["list_name"], best["name"])
+            return 0.95, best
         return best_score, None
 
     def ingest_transaction(self, actor: str, role: str, txn_ref: str, customer_id: int,
@@ -352,7 +584,9 @@ class FinancialCrimeService:
                 raise DomainError("客户不存在", 404)
             entity = self._resolve_entity(conn, customer["entity_id"])
             country = counterparty_country.strip().upper()
-            match_score, match_reason = self._screen(counterparty_name.strip(), country)
+            screened_at = utcnow()
+            match_score, matched_entry = self._match_entry(conn, counterparty_name.strip(), country)
+            match_reason = "sanctions_match:%s:%s" % (matched_entry["list_name"], matched_entry["name"]) if matched_entry else None
             base_risk = customer["risk_score"]
             reason = "normal"
             if match_reason:
@@ -387,6 +621,11 @@ class FinancialCrimeService:
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("交易编号已存在", 409) from exc
+            screen_archive = None
+            if matched_entry is not None:
+                screen_archive = ScreeningArchive(conn).record_initial(
+                    cur.lastrowid, matched_entry, match_score, actor, screened_at
+                )
             alert = None
             if status in {"review", "escalated", "blocked"}:
                 fingerprint = "%s|%s|%s" % (entity["id"], reason.split(":")[0], normalize_name(counterparty_name))
@@ -409,7 +648,8 @@ class FinancialCrimeService:
                 conn.execute("UPDATE transactions SET status='blocked' WHERE entity_id=? AND status='review'", (entity["id"],))
             self._audit(conn, actor, "transaction.ingested", {"txn_ref": txn_ref, "status": status, "reason": reason}, entity["id"])
             transaction = dict(conn.execute("SELECT * FROM transactions WHERE id=?", (cur.lastrowid,)).fetchone())
-            return {"transaction": transaction, "alert": alert, "resolved_entity_id": entity["id"]}
+            return {"transaction": transaction, "alert": alert,
+                    "screen_archive": screen_archive, "resolved_entity_id": entity["id"]}
 
     def triage_alert(self, actor: str, role: str, alert_id: int, decision: str,
                     assignee: str | None = None, case_no: str | None = None,
@@ -598,11 +838,109 @@ class FinancialCrimeService:
                 raise DomainError("案件不存在", 404)
             self._case_access(actor, role, case)
             notes = [dict(r) for r in conn.execute("SELECT * FROM case_notes WHERE case_id=? ORDER BY id", (case_id,)).fetchall()]
-            return {"case": dict(case), "notes": notes}
+            txn_rows = conn.execute(
+                """SELECT DISTINCT t.* FROM transactions t
+                   LEFT JOIN alerts a ON a.transaction_id=t.id
+                   WHERE a.case_id=? OR (t.entity_id=? AND EXISTS(
+                       SELECT 1 FROM screening_archives sa WHERE sa.transaction_id=t.id))
+                   ORDER BY t.id""",
+                (case_id, case["entity_id"]),
+            ).fetchall()
+            transactions = [dict(r) for r in txn_rows]
+            txn_ids = {t["id"] for t in txn_rows}
+            archives = ScreeningArchive(conn).for_transactions(txn_ids)
+            reviews = ListReviewQueue(conn).for_transactions(txn_ids)
+            for transaction in transactions:
+                transaction["screening_archives"] = archives.get(transaction["id"], [])
+                transaction["watchlist_reviews"] = reviews.get(transaction["id"], [])
+            return {"case": dict(case), "notes": notes, "transactions": transactions}
+
+    def get_watchlist_history(self, actor: str, role: str, entry_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        if role not in SENSITIVE_ROLES:
+            raise DomainError("角色无权查看名单历史", 403)
+        with self.connect() as conn:
+            entry = conn.execute("SELECT * FROM watchlist WHERE id=?", (entry_id,)).fetchone()
+            if not entry:
+                raise DomainError("名单条目不存在", 404)
+            return {"entry": dict(entry), "versions": WatchlistHistory(conn).versions(entry_id)}
+
+    def get_transaction_trace(self, actor: str, role: str, transaction_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        if role not in SENSITIVE_ROLES:
+            raise DomainError("角色无权查看筛查存档", 403)
+        with self.connect() as conn:
+            transaction = conn.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
+            if not transaction:
+                raise DomainError("交易不存在", 404)
+            payload = dict(transaction)
+            payload["screening_archives"] = ScreeningArchive(conn).for_transactions({transaction_id}).get(transaction_id, [])
+            payload["watchlist_reviews"] = ListReviewQueue(conn).for_transactions({transaction_id}).get(transaction_id, [])
+            return payload
+
+    def complete_list_review(self, actor: str, role: str, review_id: int, conclusion: str,
+                             note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"investigator", "supervisor"}, "复核名单变化")
+        if conclusion not in {"confirmed", "false_positive", "escalated"}:
+            raise DomainError("复核结论无效（confirmed/false_positive/escalated）")
+        note = (note or "").strip()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            review = conn.execute("SELECT * FROM watchlist_reviews WHERE id=?", (review_id,)).fetchone()
+            if not review:
+                raise DomainError("待复核记录不存在", 404)
+            if review["status"] != ListReviewQueue.PENDING:
+                raise DomainError("该版本已复核，同一版本不重复处理", 409)
+            transaction = conn.execute("SELECT * FROM transactions WHERE id=?", (review["transaction_id"],)).fetchone()
+            now = utcnow()
+            current_entry = conn.execute("SELECT * FROM watchlist WHERE id=?", (review["watchlist_entry_id"],)).fetchone()
+            score, matched = (0.0, None)
+            if current_entry and current_entry["active"]:
+                score, matched = self._match_entry(
+                    conn, transaction["counterparty_name"], transaction["counterparty_country"]
+                )
+                if matched is None or matched["id"] != current_entry["id"]:
+                    matched, score = None, score
+            rescreen = ScreeningArchive(conn).record_rescreen(
+                transaction["id"], matched if matched is not None else current_entry,
+                score if matched is not None else 0.0, review["id"], actor, now
+            )
+            alert = None
+            if conclusion == "escalated":
+                fingerprint = "listreview|%s|%s|%s" % (
+                    transaction["entity_id"], review["watchlist_entry_id"], review["to_version"]
+                )
+                existing = conn.execute("SELECT * FROM alerts WHERE fingerprint=?", (fingerprint,)).fetchone()
+                if existing:
+                    alert_id = existing["id"]
+                else:
+                    alert_cur = conn.execute(
+                        """INSERT INTO alerts(fingerprint,entity_id,transaction_id,reason,risk_score,first_seen,last_seen,status)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (fingerprint, transaction["entity_id"], transaction["id"],
+                         "watchlist_review:%s:%s" % (current_entry["list_name"] if current_entry else "unknown", review["to_version"]),
+                         0.9, now, now, "new"),
+                    )
+                    alert_id = alert_cur.lastrowid
+                alert = dict(conn.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone())
+            conn.execute(
+                """UPDATE watchlist_reviews SET status='reviewed',conclusion=?,handled_by=?,handled_at=?,
+                   note=?,rescreen_archive_id=? WHERE id=?""",
+                (conclusion, actor, now, note, rescreen["id"], review_id),
+            )
+            self._audit(conn, actor, "watchlist.reviewed",
+                        {"review_id": review_id, "transaction_id": transaction["id"],
+                         "conclusion": conclusion, "rescreen_hit": matched is not None},
+                        transaction["entity_id"])
+            return {"review": dict(conn.execute("SELECT * FROM watchlist_reviews WHERE id=?", (review_id,)).fetchone()),
+                    "rescreen": rescreen, "alert": alert}
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         if role not in SENSITIVE_ROLES:
-            return {"entities": [], "transactions": [], "alerts": [], "cases": [], "timeline": [], "access_limited": True}
+            return {"entities": [], "transactions": [], "alerts": [], "cases": [], "timeline": [],
+                    "watchlist": [], "watchlist_reviews": [], "pending_review_txn_ids": [],
+                    "access_limited": True}
         with self.connect() as conn:
             if role == "investigator":
                 cases = [dict(r) for r in conn.execute("SELECT * FROM cases WHERE assignee=? ORDER BY id DESC", (actor,)).fetchall()]
@@ -619,7 +957,16 @@ class FinancialCrimeService:
             else:
                 alerts = [dict(r) for r in conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 100").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
-        return {"entities": entities, "transactions": transactions, "alerts": alerts, "cases": cases, "timeline": timeline, "access_limited": False}
+            watchlist = [dict(r) for r in conn.execute("SELECT * FROM watchlist ORDER BY id DESC").fetchall()]
+            watchlist_reviews = ListReviewQueue(conn).list_all()
+            pending_ids = sorted(ListReviewQueue(conn).pending_transaction_ids())
+            # 给近期交易标记是否存在待复核
+            pending_lookup = set(pending_ids)
+            for txn in transactions:
+                txn["pending_list_review"] = txn["id"] in pending_lookup
+        return {"entities": entities, "transactions": transactions, "alerts": alerts, "cases": cases,
+                "timeline": timeline, "watchlist": watchlist, "watchlist_reviews": watchlist_reviews,
+                "pending_review_txn_ids": pending_ids, "access_limited": False}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -671,11 +1018,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path in {"/app.js", "/static/app.js"}:
+                body = (ROOT / "static" / "app.js").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             actor, role = self._headers()
             if path == "/health":
                 self._send(200, {"status": "ok", "service": "financial-crime"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path.startswith("/api/watchlist/") and path.endswith("/history"):
+                self._send(200, self.service.get_watchlist_history(actor, role, int(path.split("/")[3])))
+            elif path.startswith("/api/transactions/"):
+                self._send(200, self.service.get_transaction_trace(actor, role, int(path.split("/")[3])))
             elif path.startswith("/api/cases/"):
                 self._send(200, self.service.get_case(actor, role, int(path.split("/")[3])))
             else:
@@ -710,6 +1069,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.merge_entities(actor, role, **data)
             elif path == "/api/cases/report":
                 result = self.service.file_report(actor, role, **data)
+            elif path == "/api/watchlist/review":
+                result = self.service.complete_list_review(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
